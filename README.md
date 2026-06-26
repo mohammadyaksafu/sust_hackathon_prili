@@ -1,15 +1,6 @@
 # QueueStorm Investigator
-**bKash SUST CSE Carnival 2026 — Codex Community Hackathon**
+**bKash SUST CSE Carnival 2026 — Codex Community Hackathon**  
 AI/API SupportOps Challenge for Digital Finance
-
----
-
-## Tech Stack
-- Python 3.11
-- FastAPI + Uvicorn
-- httpx (async LLM API calls)
-- Pydantic v2 (validation + settings)
-- Multi-provider LLM: Gemini (default) / Anthropic Claude / OpenAI
 
 ---
 
@@ -20,16 +11,11 @@ git clone <your-repo-url>
 cd queuestorm
 
 cp .env.example .env
-# Edit .env — add your GEMINI_API_KEY (or ANTHROPIC/OPENAI) and set ACTIVE_PROVIDER
+# Edit .env — set GEMINI_API_KEY and MODEL_NAME=gemini-2.0-flash-lite
 
 pip install -r requirements.txt
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Test:
-```bash
-python test_local.py
 ```
 
 Health check:
@@ -38,19 +24,27 @@ curl http://localhost:8000/health
 # → {"status":"ok"}
 ```
 
+Run local smoke tests:
+```bash
+python test_local.py
+```
+
 ---
 
 ## Deploy on Railway
 
-1. Push this repo to GitHub.
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub.
-3. Select your repo.
-4. In Railway dashboard → Variables, add:
-   - `ACTIVE_PROVIDER` = `gemini`
-   - `GEMINI_API_KEY` = your key
-   - (optional) `MODEL_NAME`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`
-5. Railway auto-detects `railway.toml` and deploys.
-6. Your live URL will be `https://<project>.up.railway.app`.
+1. Push this repo to GitHub (make sure `.env` is in `.gitignore`).
+2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub repo.
+3. In Railway dashboard → **Variables** tab, add:
+
+| Variable | Value |
+|---|---|
+| `ACTIVE_PROVIDER` | `gemini` |
+| `GEMINI_API_KEY` | your key from [aistudio.google.com](https://aistudio.google.com/app/apikey) |
+| `MODEL_NAME` | `gemini-2.0-flash-lite` |
+| `PORT` | `8000` |
+
+4. Railway auto-detects `railway.toml` and deploys. Live URL: `https://<project>.up.railway.app`
 
 ---
 
@@ -60,104 +54,210 @@ curl http://localhost:8000/health
 ```json
 {"status": "ok"}
 ```
+Must respond within 60 seconds of service start.
 
 ### POST /analyze-ticket
-Request body per the QueueStorm problem statement schema.
+Accepts one ticket per request. Must respond within 30 seconds.
 
-Example:
 ```bash
 curl -X POST https://<your-url>/analyze-ticket \
   -H "Content-Type: application/json" \
-  -d @sample_output.json
+  -d '{
+    "ticket_id": "TKT-001",
+    "complaint": "I sent 5000 taka to a wrong number around 2pm today.",
+    "language": "en",
+    "channel": "in_app_chat",
+    "user_type": "customer",
+    "transaction_history": [
+      {
+        "transaction_id": "TXN-9101",
+        "timestamp": "2026-04-14T14:08:22Z",
+        "type": "transfer",
+        "amount": 5000,
+        "counterparty": "+8801719876543",
+        "status": "completed"
+      }
+    ]
+  }'
+```
+
+Sample response:
+```json
+{
+  "ticket_id": "TKT-001",
+  "relevant_transaction_id": "TXN-9101",
+  "evidence_verdict": "consistent",
+  "case_type": "wrong_transfer",
+  "severity": "high",
+  "department": "dispute_resolution",
+  "agent_summary": "Customer reports sending 5000 BDT to wrong recipient via TXN-9101.",
+  "recommended_next_action": "Initiate wrong-transfer dispute process per internal SOP.",
+  "customer_reply": "We have received your complaint regarding TXN-9101. Our dispute resolution team will investigate and contact you within 24-48 hours through official bKash channels.",
+  "human_review_required": true,
+  "confidence": 0.88,
+  "reason_codes": ["wrong_transfer", "transaction_match", "high_value_transaction"]
+}
 ```
 
 ---
 
 ## Architecture
 
+The service is a **complaint investigator**, not a classifier. Every request includes both the complaint text and a transaction history snippet. The pipeline compares them and decides what actually happened before classifying or routing anything.
+
 ```
-FastAPI + Pydantic validation (400 on bad schema)
-  │
-Input injection scan  ← catches prompt injection in complaint text
-  │
-Deterministic evidence pre-match  ← fast, no LLM, amount+time+counterparty scoring
-  │
-LLM Pass 1: Evidence reasoning  ← focused prompt: which txn? consistent or not?
-  │
-LLM Pass 2: Classification + routing  ← case_type, department, severity, summaries
-  │
-Confidence arbitration  ← cross-checks verdict vs classification, forces human_review
-  │
-Safety guardrails (pre-generation)  ← blocks PIN/OTP/refund-confirm patterns
-  │
-Output injection scan  ← second pass over all output fields
-  │
-Enum enforcer  ← hard-enforces exact enum values, fallbacks on mismatch
-  │
-POST /analyze-ticket → 200 JSON
+POST /analyze-ticket (HTTP request in)
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  FastAPI + Pydantic validation      │  ← 400 on bad schema, 422 on empty complaint
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐  ╔══════════════╗
+│  Input injection scan          [🛡] │  ║ SAFETY GATE  ║
+│  Detect + sanitize prompt injection │  ║   LAYER 1    ║
+└─────────────────────────────────────┘  ╚══════════════╝
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  Deterministic evidence match       │  ← No LLM cost
+│  Amount + counterparty + timestamp  │  ← Scores every transaction
+│  scoring → candidate transaction ID │  ← Seeds LLM to reduce hallucination
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  Rate limit guard                   │  ← Proactive spacing, prevents 429
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  LLM Pass 1 — Evidence reasoning    │  ← Gemini Flash Lite
+│  · Which transaction matches?       │
+│  · Is complaint consistent with it? │
+│  → relevant_transaction_id          │
+│  → evidence_verdict                 │
+└─────────────────────────────────────┘
+         │  (if LLM fails → deterministic fallback, always returns valid response)
+         ▼
+┌─────────────────────────────────────┐
+│  Rate limit guard                   │  ← Second spacing before Pass 2
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  LLM Pass 2 — Classify + route      │  ← Gemini Flash Lite
+│  · case_type                        │
+│  · department                       │
+│  · severity                         │
+│  · agent_summary                    │
+│  · recommended_next_action          │
+│  · customer_reply                   │
+└─────────────────────────────────────┘
+         │  (if LLM fails → keyword-based fallback)
+         ▼
+┌─────────────────────────────────────┐
+│  Confidence arbitration             │  ← Python rules, not LLM judgment
+│  Force human_review_required = true │
+│  when ANY of:                       │
+│  · evidence_verdict = inconsistent  │
+│  · No transaction match found       │
+│  · Combined confidence < 0.55       │
+│  · Amount ≥ 5000 BDT               │
+│  · Fraud / phishing case type       │
+│  · Injection detected in input      │
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐  ╔══════════════╗
+│  Safety guardrails             [🛡] │  ║ SAFETY GATE  ║
+│  Strip PIN/OTP/refund-confirm       │  ║   LAYER 2    ║
+│  patterns from customer_reply       │  ╚══════════════╝
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐  ╔══════════════╗
+│  Output field scan             [🛡] │  ║ SAFETY GATE  ║
+│  Scan all output fields for leaks   │  ║   LAYER 3    ║
+│  Replace violations with fallback   │  ╚══════════════╝
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  Enum enforcer                      │  ← Hard-enforce exact enum values
+│  case_type · department · severity  │  ← Fallback to safe defaults on mismatch
+│  evidence_verdict                   │
+└─────────────────────────────────────┘
+         │
+         ▼
+HTTP 200 JSON response  (<30s · valid schema · safe reply)
 ```
 
 ---
 
 ## AI Approach
 
-Two focused LLM passes rather than one monolithic prompt:
+**Two focused LLM passes** instead of one monolithic prompt:
 
-**Pass 1 — Evidence reasoning** receives only the complaint and transaction history. It identifies which transaction the complaint refers to and returns `relevant_transaction_id` + `evidence_verdict`. A deterministic pre-match (amount, time, counterparty scoring) seeds the LLM with a candidate, reducing hallucination.
+**Pass 1 — Evidence reasoning** receives only the complaint and transaction history. It returns `relevant_transaction_id` and `evidence_verdict`. A deterministic pre-match runs first — this seeds the LLM with a candidate transaction ID, dramatically reducing hallucination on the most critical output field.
 
-**Pass 2 — Classification + routing** receives the complaint, metadata, and the evidence verdict from pass 1. It outputs `case_type`, `department`, `severity`, `agent_summary`, `recommended_next_action`, `customer_reply`, and `human_review_required`.
+**Pass 2 — Classification and routing** receives the complaint, metadata, and the verdict from Pass 1. It returns `case_type`, `department`, `severity`, `agent_summary`, `recommended_next_action`, and `customer_reply`.
+
+Separating these two concerns means each LLM call gets a tightly focused prompt, producing more accurate and consistent outputs than a single large prompt trying to do everything at once.
 
 ---
 
 ## Safety Logic
 
-Three layers:
+Three independent layers protect every response. A violation caught by any layer does not depend on the others.
 
-1. **Input scan**: Regex patterns detect prompt injection in the complaint before it reaches the LLM. Injected complaints are flagged, complaint text is sanitized, and the ticket is routed as `phishing_or_social_engineering` with `human_review_required=true`.
+**Layer 1 — Input scan**: Regex patterns detect prompt injection in the complaint before it reaches the LLM. Injected complaints are sanitized and routed as `phishing_or_social_engineering` with `human_review_required=true`.
 
-2. **Pre-generation constraints**: The Pass 2 system prompt hard-codes all safety rules as LLM instructions — never request credentials, never confirm refunds, official channels only.
+**Layer 2 — Pre-generation constraints**: The Pass 2 system prompt hard-codes all safety rules as LLM instructions: never request credentials, never confirm refunds, direct customers to official channels only.
 
-3. **Output scan**: After generation, all output fields are scanned for credential requests, unauthorized refund promises, and third-party redirects. Violations trigger field replacement with the safe fallback reply and set `human_review_required=true`.
+**Layer 3 — Output scan**: After generation, all output fields are scanned for credential requests, unauthorized refund confirmations, and third-party redirects. Violations replace `customer_reply` with the safe fallback and set `human_review_required=true`.
 
-`human_review_required` is forced `true` by Python rules (not LLM judgment) when:
+`human_review_required` is additionally forced `true` by Python rules — independent of the LLM — when:
 - `evidence_verdict = inconsistent`
-- No transaction match found
+- No transaction match found in history
 - Combined confidence < 0.55
 - Amount ≥ 5000 BDT
-- Fraud/phishing case type
-- Injection detected
+- Case type is phishing or social engineering
+- Prompt injection detected in input
 
 ---
 
-## Models Used
+## Rate Limit Handling
 
-| Provider | Model | Why |
-|---|---|---|
-| Gemini (default) | gemini-2.0-flash | Fast, cheap, strong JSON output, good multilingual (Bengali support) |
-| Anthropic | claude-haiku-4-5-20251001 | Fast and reliable, strong safety alignment |
-| OpenAI | gpt-4o-mini | Fallback option, reliable JSON mode |
+Gemini free tier allows 30 requests/minute for `gemini-2.0-flash-lite`. The service handles this at three levels:
 
-Switch provider via `ACTIVE_PROVIDER` env var. No code changes needed.
+1. **Proactive rate limiter** in `pipeline.py` tracks calls in a rolling 60-second window and waits before sending if approaching 25 RPM — preventing 429s before they happen.
+2. **Retry logic** in `llm_client.py` retries up to 3 times on 429/5xx with short waits (2s, 4s, 6s) — total max 12s, safely fits inside the 30-second judge deadline.
+3. **Deterministic fallback** activates if LLM is still unavailable — returns a valid structured response using keyword matching and the pre-matched transaction rather than failing with 500.
 
 ---
 
-## Cost Reasoning
+## MODELS
 
-Each ticket uses 2 LLM calls. At Gemini Flash pricing (~$0.075/1M input tokens):
-- Pass 1: ~400 tokens in + ~150 out ≈ $0.000040
-- Pass 2: ~500 tokens in + ~300 out ≈ $0.000059
-- Total per ticket: ~$0.0001
+| Provider | Model | Where it runs | Why chosen |
+|---|---|---|---|
+| Gemini | `gemini-2.0-flash-lite` | Google AI API (remote) | 30 RPM free tier (double standard Flash), fast JSON output, strong Bengali/Banglish support, lowest latency for two-pass pipeline |
 
-For 40,000 tickets: ~$4 total.
+Model is set via `MODEL_NAME` environment variable. Default: `gemini-2.0-flash-lite`.
+
+**Cost per ticket**: ~2 LLM calls × ~450 tokens average = ~900 tokens.  
+At Gemini Flash Lite pricing (~$0.0375/1M input tokens): **~$0.000034 per ticket**.  
+For 40,000 tickets: **~$1.36 total**.
 
 ---
 
 ## Known Limitations
 
-- Bengali/Banglish complaint parsing relies on LLM multilingual capability; deterministic amount extraction only handles numeric BDT patterns.
-- Deterministic matching uses timestamps relative to current time, which may score historical cases differently.
-- No persistent state — each ticket is processed independently.
-- Rate limits of the chosen LLM provider apply; under very high load, queue externally.
+- Bengali/Banglish numeric amount extraction uses regex; non-numeric amounts (e.g. "পাঁচ হাজার টাকা") rely on LLM.
+- Deterministic timestamp matching scores against current time — historical test cases score lower on time proximity signal.
+- No persistent state: each ticket is independent, no session memory.
+- In-memory rate limiter resets on restart and does not coordinate across multiple instances.
 
 ---
 
@@ -165,10 +265,25 @@ For 40,000 tickets: ~$4 total.
 
 | Variable | Required | Description |
 |---|---|---|
-| `ACTIVE_PROVIDER` | Yes | `gemini` \| `anthropic` \| `openai` |
-| `GEMINI_API_KEY` | If Gemini | Google AI Studio API key |
-| `ANTHROPIC_API_KEY` | If Anthropic | Anthropic API key |
-| `OPENAI_API_KEY` | If OpenAI | OpenAI API key |
-| `MODEL_NAME` | No | Override model name |
-| `PORT` | No | Server port (default 8000) |
-| `DEBUG` | No | Enable debug logging |
+| `ACTIVE_PROVIDER` | Yes | `gemini` |
+| `GEMINI_API_KEY` | Yes | Google AI Studio API key |
+| `MODEL_NAME` | Recommended | `gemini-2.0-flash-lite` for higher free tier quota |
+| `PORT` | No | Server port (default 8000, set automatically by Railway) |
+| `DEBUG` | No | Enable debug logging (`true` / `false`) |
+
+---
+
+## Submission Checklist
+
+- [x] `GET /health` returns `{"status":"ok"}` within 60s of start
+- [x] `POST /analyze-ticket` responds within 30s
+- [x] All required response fields present with correct enum values
+- [x] `customer_reply` never requests PIN, OTP, or password
+- [x] `customer_reply` never confirms refund or reversal
+- [x] Prompt injection in complaint does not override output fields
+- [x] `human_review_required=true` on disputes, fraud, inconsistent evidence, high-value amounts
+- [x] Returns 400 on malformed JSON, 422 on empty complaint
+- [x] No secrets or stack traces in any response or log output
+- [x] `.env` excluded from version control via `.gitignore`
+- [x] `README.md`, `requirements.txt`, `.env.example`, `sample_output.json` all present
+- [x] `MODELS` section present with model name, location, and justification
